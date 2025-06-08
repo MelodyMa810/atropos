@@ -57,7 +57,7 @@ class GSM8kEnv(BaseEnv):
     @classmethod
     def config_init(cls) -> Tuple[BaseEnvConfig, List[APIServerConfig]]:
         env_config = BaseEnvConfig(
-            tokenizer_name="NousResearch/DeepHermes-3-Llama-3-3B-Preview",
+            tokenizer_name="Qwen/Qwen2.5-1.5B-Instruct",
             group_size=8,
             use_wandb=True,
             rollout_server_url="http://localhost:8000",
@@ -69,8 +69,8 @@ class GSM8kEnv(BaseEnv):
         )
         server_configs = [
             APIServerConfig(
-                model_name="NousResearch/DeepHermes-3-Llama-3-3B-Preview",
-                base_url="http://localhost:9001/v1",
+                model_name="Qwen/Qwen2.5-1.5B-Instruct",
+                base_url="http://localhost:15001/v1",
                 api_key="x",
                 num_requests_for_eval=256,
             ),
@@ -99,8 +99,11 @@ class GSM8kEnv(BaseEnv):
         await super().wandb_log(wandb_metrics)
 
     async def setup(self):
+        print("Setting up GSM8K environment...")
         self.train = load_dataset("gsm8k", "main", split="train").shuffle(seed=42)
+        print(f"Loaded training dataset with {len(self.train)} examples")
         test_data = load_dataset("gsm8k", "main", split="test").shuffle(seed=42)
+        print(f"Loaded test dataset with {len(test_data)} examples")
         self.test = list()
         for item in test_data:
             self.test.append(
@@ -113,6 +116,7 @@ class GSM8kEnv(BaseEnv):
                 }
             )
         self.iter = 0
+        print("Setup complete!")
 
     def save_checkpoint(self, step, data=None):
         if data is None:
@@ -170,19 +174,35 @@ class GSM8kEnv(BaseEnv):
     async def collect_trajectories(
         self, item: GSM8kRow
     ) -> Tuple[ScoredDataGroup, list[Item]]:
+        print(f"\nStarting collect_trajectories for item {self.iter}...")
         user_message = {"role": "user", "content": item["question"]}
         gold_answer = (
             "\\boxed{" + item["answer"].split("#")[-1].strip().replace(",", "") + "}"
         )
+        print(f"Question: {item['question'][:100]}...")
 
-        chat_completions = await self.server.chat_completion(
-            messages=[{"role": "system", "content": system_prompt}, user_message],
-            n=self.config.group_size,
-            max_tokens=self.config.max_token_length,
-        )
+        print("Calling chat_completion...")
+        try:
+            print("Preparing messages for chat completion...")
+            messages = [{"role": "system", "content": system_prompt}, user_message]
+            print(f"Messages prepared: {messages}")
+            
+            print("Making chat completion request...")
+            chat_completions = await self.server.chat_completion(
+                messages=messages,
+                n=self.config.group_size,
+                max_tokens=self.config.max_token_length,
+            )
+            print(f"Got {len(chat_completions.choices)} completions")
+        except Exception as e:
+            print(f"Error in chat_completion: {str(e)}")
+            print(f"Error type: {type(e)}")
+            raise e
+        
         to_score = list()
         to_backlog = list()
         for i, chat_completion in enumerate(chat_completions.choices):
+            print(f"Processing completion {i+1}/{len(chat_completions.choices)}")
             messages = (
                 {"role": "system", "content": system_prompt},
                 user_message,
@@ -195,26 +215,33 @@ class GSM8kEnv(BaseEnv):
                     "finish_reason": chat_completion.finish_reason,
                 }
             )
+        print("Scoring completions...")
         to_postprocess = await self.score(to_score)
+        print("Finished scoring")
         return to_postprocess, to_backlog
 
     async def score(
         self, rollout_group_data
     ) -> Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]]:
+        print("Starting score method...")
         scores = ScoredDataGroup()
         scores["tokens"] = list()
         scores["masks"] = list()
         scores["scores"] = list()
+        
+        print("Parsing gold answer...")
         gold_parsed = parse(
             rollout_group_data[0]["gold_answer"],
             extraction_mode="first_match",
             extraction_config=[LatexExtractionConfig()],
         )
+        print(f"Gold answer parsed: {len(gold_parsed) != 0}")
+        
         if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
+            print("Processing rollouts...")
             random.shuffle(rollout_group_data)
-            for item in rollout_group_data:
-                # print(item[0][-1]["content"])
+            for i, item in enumerate(rollout_group_data):
+                print(f"Processing rollout {i+1}/{len(rollout_group_data)}")
                 answer_parsed = parse(
                     item["messages"][-1]["content"].split("</think>")[-1],
                     extraction_config=[
@@ -227,30 +254,28 @@ class GSM8kEnv(BaseEnv):
                                 boxed="all",
                                 units=True,
                             ),
-                            # Ensures that boxed is tried first
                             boxed_match_priority=0,
                             try_extract_without_anchor=False,
                         )
                     ],
                     extraction_mode="first_match",
                 )
-                # Reward 1 if the content is the same as the ground truth, 0 otherwise
                 reward = verify(answer_parsed, gold_parsed)
-                # print(
-                #     f"message: {item[0][-1]['content']}, ground_truth: {item[1]}, reward: {reward}"
-                # )
+                print(f"Rollout {i+1} reward: {reward}")
+                
                 out_dict = tokenize_for_trainer(
                     self.tokenizer, item["messages"], item["finish_reason"]
                 )
                 tokens = out_dict["tokens"]
                 masks = out_dict["masks"]
-                # remove obviously bad examples
                 if len([1 for i in masks if i != -100]) < 10:
+                    print(f"Skipping rollout {i+1} due to short length")
                     continue
                 scores["tokens"].append(tokens)
                 scores["masks"].append(masks)
                 scores["scores"].append(1.0 if reward else -1.0)
                 if len(scores["tokens"]) >= self.config.group_size:
+                    print("Reached group size limit")
                     break
             for score in scores["scores"]:
                 self.percent_correct_buffer.append(max(score, 0))
