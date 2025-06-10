@@ -186,6 +186,9 @@ wandb
 .gradio/
 
 example_trainer/trained_model_checkpoints/
+environments/gsm8k_test_trained_model_checkpoints/
+environments/game_environments/customer_service/trained_model_checkpoints
+environments/game_environments/customer_service/logs/
 
 # uv
 uv.lock

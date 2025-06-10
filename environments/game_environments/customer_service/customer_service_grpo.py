@@ -8,6 +8,7 @@ import string
 import subprocess
 import time
 from typing import List, Optional, Tuple
+from datetime import datetime
 
 import numpy as np
 import requests
@@ -21,6 +22,35 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Global variable to keep track of the vLLM process
 vllm_process = None
+
+def setup_step_logging(save_path: str):
+    """Set up step-level progress logging"""
+    os.makedirs(save_path, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    step_log_file = os.path.join(save_path, f"training_steps_{timestamp}.log")
+    
+    # Write header
+    with open(step_log_file, 'w') as f:
+        f.write(f"Training Step Progress Log - Started: {datetime.now()}\n")
+        f.write("=" * 60 + "\n")
+        f.write("Format: [TIMESTAMP] STEP X/Y - STATUS\n\n")
+    
+    return step_log_file
+
+def log_step_progress(step_log_file: str, step: int, total_steps: int, status: str, details: str = ""):
+    """Log training step progress to file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] STEP {step+1:2d}/{total_steps} - {status}"
+    if details:
+        log_entry += f" | {details}"
+    log_entry += "\n"
+    
+    # Append to file
+    with open(step_log_file, 'a') as f:
+        f.write(log_entry)
+    
+    # Also print to console
+    print(f"📝 {log_entry.strip()}")
 
 
 def cleanup_vllm():
@@ -217,6 +247,10 @@ def train(config: TrainingConfig):
     """
     global vllm_process  # Declare intention to modify the global variable
 
+    # --- Step Logging Setup ---
+    step_log_file = setup_step_logging(config.save_path)
+    log_step_progress(step_log_file, -1, config.training_steps, "INITIALIZING", "Setting up training environment")
+
     # --- Wandb Setup ---
     if config.use_wandb:
         if not config.wandb_project:
@@ -237,12 +271,15 @@ def train(config: TrainingConfig):
                 print(
                     f"Wandb logging enabled. Run: {wandb.run.name} (Project: {config.wandb_project}) "
                 )
+                log_step_progress(step_log_file, -1, config.training_steps, "WANDB_INIT", f"Connected to project: {config.wandb_project}")
             except Exception as e:
                 print(f"Error initializing wandb: {e}. Disabling wandb.")
                 config.use_wandb = False
+                log_step_progress(step_log_file, -1, config.training_steps, "WANDB_ERROR", f"Failed to initialize: {e}")
     # --- End Wandb Setup ---
 
     # Initialize model and tokenizer
+    log_step_progress(step_log_file, -1, config.training_steps, "MODEL_LOADING", f"Loading {config.model_name}")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name, torch_dtype=torch.bfloat16
@@ -263,9 +300,11 @@ def train(config: TrainingConfig):
     )
 
     os.makedirs(config.save_path, exist_ok=True)  # Ensure base save directory exists
+    log_step_progress(step_log_file, -1, config.training_steps, "TRAINER_REGISTER", "Registering with Atropos API")
     register_trainer(config)
 
     # Init vllm
+    log_step_progress(step_log_file, -1, config.training_steps, "VLLM_STARTING", f"Launching vLLM on port {config.vllm_port}")
     vllm_command = [
         "python",
         "-m",
@@ -277,13 +316,14 @@ def train(config: TrainingConfig):
         "--dtype",
         "auto",
         "--gpu-memory-utilization",
-        "0.1",
+        "0.2",
         "--disable-log-requests",
     ]
     print(f"  Launching vLLM server: {' '.join(vllm_command)}")
     try:
         vllm_process = subprocess.Popen(vllm_command)
         print(f"  vLLM server launched with PID: {vllm_process.pid}")
+        log_step_progress(step_log_file, -1, config.training_steps, "VLLM_LAUNCHED", f"PID: {vllm_process.pid}")
         # Check immediate errors
         try:
             stdout, stderr = vllm_process.communicate(timeout=2)
@@ -292,8 +332,10 @@ def train(config: TrainingConfig):
                 vllm_process = None
                 # Maybe raise error or just warn?
                 print("  WARNING: Failed to start vLLM server after checkpoint.")
+                log_step_progress(step_log_file, -1, config.training_steps, "VLLM_ERROR", "Failed to start")
         except subprocess.TimeoutExpired:
             print("  vLLM process started (check logs for details).")
+            log_step_progress(step_log_file, -1, config.training_steps, "VLLM_READY", "Process started successfully")
     except FileNotFoundError:
         print(
             "\n *** ERROR: 'python -m vllm...' command not found. Make sure vLLM is installed and accessible. ***\n"
@@ -303,15 +345,21 @@ def train(config: TrainingConfig):
         config.vllm_restart_interval = (
             config.training_steps + 1
         )  # Prevent further restarts
+        log_step_progress(step_log_file, -1, config.training_steps, "VLLM_NOT_FOUND", "Disabling vLLM restarts")
     except Exception as e:
         print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
         print("  Disabling further vLLM restarts.")
         config.vllm_restart_interval = (
             config.training_steps + 1
         )  # Prevent further restarts
+        log_step_progress(step_log_file, -1, config.training_steps, "VLLM_LAUNCH_ERROR", str(e))
 
+    log_step_progress(step_log_file, -1, config.training_steps, "READY", "Starting training loop")
+    
     batches = list()
     for step in range(config.training_steps):
+        log_step_progress(step_log_file, step, config.training_steps, "STARTED", "Beginning training step")
+        
         total_loss = 0
         print(f"Step {step+1}/{config.training_steps}")
         total_pos_logp = 0
@@ -320,7 +368,9 @@ def train(config: TrainingConfig):
         total_pos = 0
         total_neg = 0
         if len(batches) == 0:
+            log_step_progress(step_log_file, step, config.training_steps, "DATA_REQUEST", "Requesting rollout batch")
             batches = get_data(config.batch_size, config.seq_len)
+            log_step_progress(step_log_file, step, config.training_steps, "DATA_RECEIVED", f"Got {len(batches)} batches")
         token_batches, label_batches, advantage_batches = batches.pop(0)
         # Terminate existing vLLM process if running
         if (
@@ -339,6 +389,9 @@ def train(config: TrainingConfig):
                     vllm_process.kill()
                     vllm_process.wait()
                 vllm_process = None
+        
+        log_step_progress(step_log_file, step, config.training_steps, "TRAINING", f"Processing {len(token_batches)} mini-batches")
+        
         for tokens, labels, advantages in zip(
             token_batches, label_batches, advantage_batches
         ):
@@ -394,6 +447,9 @@ def train(config: TrainingConfig):
             total_pos_logp /= total_pos
         if total_neg > 0:
             total_neg_logp /= total_neg
+        
+        log_step_progress(step_log_file, step, config.training_steps, "COMPLETED", f"Loss: {total_loss:.4f}, Grad norm: {grad_norm.item():.4f}")
+        
         # --- Wandb Logging ---
         if config.use_wandb:
             wandb.log(
@@ -419,6 +475,7 @@ def train(config: TrainingConfig):
             checkpoint_path = os.path.join(
                 config.save_path, f"step_{step+1}"
             )  # Save as step+1 since it's after step completion
+            log_step_progress(step_log_file, step, config.training_steps, "CHECKPOINT", f"Saving to {checkpoint_path}")
             print(f"  Saving checkpoint to {checkpoint_path}...")
             # Ensure fresh directory for saving
             if os.path.exists(checkpoint_path):
@@ -455,11 +512,12 @@ def train(config: TrainingConfig):
                 "--dtype",
                 "auto",
                 "--gpu-memory-utilization",
-                "0.1",
+                "0.2",  # Reduced from 0.45 to 0.2 for Qwen 1.5B model
                 "--disable-log-requests",
                 "--served-model-name",
                 config.model_name,
             ]
+            log_step_progress(step_log_file, step, config.training_steps, "VLLM_RESTART", f"Restarting with checkpoint {step+1}")
             print(f"  Launching vLLM server: {' '.join(vllm_command)}")
             torch.cuda.empty_cache()
             try:
@@ -478,8 +536,10 @@ def train(config: TrainingConfig):
                         print(
                             "  WARNING: Failed to start vLLM server after checkpoint."
                         )
+                        log_step_progress(step_log_file, step, config.training_steps, "VLLM_RESTART_ERROR", "Failed to restart")
                 except subprocess.TimeoutExpired:
                     print("  vLLM process started (check logs for details).")
+                    log_step_progress(step_log_file, step, config.training_steps, "VLLM_RESTARTED", f"New PID: {vllm_process.pid}")
             except FileNotFoundError:
                 print(
                     "\n *** ERROR: 'python -m vllm...' command not found. ",
@@ -490,12 +550,14 @@ def train(config: TrainingConfig):
                 config.vllm_restart_interval = (
                     config.training_steps + 1
                 )  # Prevent further restarts
+                log_step_progress(step_log_file, step, config.training_steps, "VLLM_NOT_FOUND", "Disabling further restarts")
             except Exception as e:
                 print(f"\n *** ERROR: Failed to launch vLLM: {e} ***\n")
                 print("  Disabling further vLLM restarts.")
                 config.vllm_restart_interval = (
                     config.training_steps + 1
                 )  # Prevent further restarts
+                log_step_progress(step_log_file, step, config.training_steps, "VLLM_RESTART_FAIL", str(e))
         # --- End vLLM Restart Logic ---
 
         # Basic check if vLLM process terminated unexpectedly (outside interval check)
@@ -511,11 +573,14 @@ def train(config: TrainingConfig):
             )
             print(f"vLLM stderr: {stderr_output}")
             vllm_process = None  # Reset so it relaunches next interval
+            log_step_progress(step_log_file, step, config.training_steps, "VLLM_CRASHED", f"Return code: {vllm_process.returncode if vllm_process else 'unknown'}")
 
+    log_step_progress(step_log_file, config.training_steps-1, config.training_steps, "TRAINING_COMPLETE", "All training steps finished")
     print("Training finished.")
     # --- Wandb Finish ---
     if config.use_wandb:
         wandb.finish()
+        log_step_progress(step_log_file, config.training_steps-1, config.training_steps, "WANDB_FINISHED", "Closed WandB session")
     # --- End Wandb Finish ---
     # Final cleanup (vLLM termination) is handled by atexit
 
@@ -528,6 +593,14 @@ def train(config: TrainingConfig):
     model.save_pretrained(final_save_path)
     tokenizer.save_pretrained(final_save_path)
     print("Final model saved.")
+    log_step_progress(step_log_file, config.training_steps-1, config.training_steps, "FINAL_SAVE", f"Model saved to {final_save_path}")
+    
+    # Write completion summary
+    with open(step_log_file, 'a') as f:
+        f.write(f"\n" + "=" * 60 + "\n")
+        f.write(f"Training completed at: {datetime.now()}\n")
+        f.write(f"Total steps completed: {config.training_steps}\n")
+        f.write(f"Final model saved to: {final_save_path}\n")
 
 
 # Example usage (optional, can be run from another script)
@@ -535,16 +608,16 @@ if __name__ == "__main__":
     # Example: Create a config and run training
     # Replace "gpt2" with your desired model
     training_config = TrainingConfig(
-        model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",  # Smaller model that actually exists
+        model_name="Qwen/Qwen2.5-1.5B-Instruct",  # Smaller model for testing
         training_steps=30,  # ~1.5 epochs for good coverage without overfitting
         vllm_restart_interval=5,  # Balance between fresh policy and efficiency
         use_wandb=True,
         wandb_project="customerservice-grpo",
         wandb_group="test-run",  # Added group for organization
         lr=3e-6,  # Lower LR for stable RL learning on conversational data
-        batch_size=2,  # Good for conversation diversity
-        gradient_accumulation_steps=20,  # Effective batch of 40 for stable gradients
-        save_path="trained_model_checkpoints",  # Explicitly set save path
+        batch_size=2,  
+        gradient_accumulation_steps=40,  
+        save_path="trained_model_checkpoints"
     )
 
     # --- End Mock ---
