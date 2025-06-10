@@ -124,7 +124,7 @@ class TwentyQuestionsEnv(BaseEnv):
             APIServerConfig(
                 model_name="gpt-4o-mini",
                 base_url="https://api.openai.com/v1",
-                api_key=os.getenv("OPENAI_API_KEY", "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"),
+                api_key=os.getenv("OPENAI_API_KEY"),
                 num_requests_for_eval=128,
                 temperature=0.0,  # To be as deterministic as possible
                 max_tokens=1024,
@@ -133,7 +133,7 @@ class TwentyQuestionsEnv(BaseEnv):
             APIServerConfig(
                 model_name="gpt-4o-mini",
                 base_url="https://api.openai.com/v1",
-                api_key=os.getenv("OPENAI_API_KEY", "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"),
+                api_key=os.getenv("OPENAI_API_KEY"),
                 num_requests_for_eval=128,
                 temperature=0.0,  # To be as deterministic as possible
                 max_tokens=1024,
